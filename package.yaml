@@ -1,0 +1,22 @@
+name:                ghcid-nvim-simple
+version:             0.1.0.0
+
+dependencies:
+- base >= 4.7 && < 5
+
+library:
+  source-dirs: src
+  ghc-options:
+    - -Wall
+  dependencies:
+    - nvim-hs >= 0.2.2
+    - nvim-hs-contrib >= 0.2.0
+    - ghcid
+    - lens
+    - Cabal >= 2.0.0.0
+    - filepath
+    - directory
+    - bytestring
+    - containers
+    - exceptions
+    - extra

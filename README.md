@@ -1,0 +1,2 @@
+
+# ghcid-nvim-simple
