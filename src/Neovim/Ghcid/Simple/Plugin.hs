@@ -4,17 +4,19 @@
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE TypeApplications    #-}
 
 module Neovim.Ghcid.Simple.Plugin where
 
 import           Control.Arrow                          (second)
-import           Control.Lens                           (makeLenses, use, uses,
-                                                         view)
+import           Control.Concurrent.STM
+import           Control.Lens                           (makeLenses)
 import           Control.Lens.Operators
 import           Control.Monad                          (forM_, unless)
-import           Control.Monad.Catch                    (SomeException, catch,
-                                                         throwM)
+import           Control.Monad.IO.Class
+import           Control.Monad.Reader
+import           Control.Monad.Catch                    (SomeException, catch, throwM)
 import           Control.Monad.Extra                    (whenJust)
 import qualified Data.ByteString.Char8                  as B
 import           Data.List                              (find, isSuffixOf)
@@ -35,6 +37,7 @@ import           Neovim.User.Choice                     (askForIndex)
 import           System.Directory                       (canonicalizePath,
                                                          getDirectoryContents)
 import           System.FilePath.Posix                  (isRelative, (</>))
+import           System.IO.Unsafe                       (unsafePerformIO)
 
 -------------------------------------------------------------------------------
 -- Types
@@ -55,17 +58,62 @@ filesInTarget t = S.map snd (t^.targetFiles)
 moduleNamesInTarget :: Target -> Set FilePath
 moduleNamesInTarget t = S.map fst (t^.targetFiles)
 
-data GhcidState = GhcidState {
-    _targets :: !(Map Int Target)
-  , _unique  :: !Int
+type NeovimGhcid = Neovim GhcidEnv
+
+data GhcidEnv = GhcidEnv
+  { targets :: !(TVar (Map Int Target))
+  , unique  :: !(TVar Int)
   }
-makeLenses ''GhcidState
+makeLenses ''GhcidEnv
+
+initialEnv :: GhcidEnv
+initialEnv = GhcidEnv
+  { targets = unsafePerformIO (newTVarIO M.empty)
+  , unique  = unsafePerformIO (newTVarIO 0)
+  }
+
+genUnique :: NeovimGhcid Int
+genUnique = do
+  v <- asks unique
+  liftIO $ atomically $ do
+    modifyTVar' v (+1)
+    readTVar v
+
+
+-- Util
+--------
+readTVar_ :: MonadIO m => TVar a -> m a
+readTVar_ = liftIO . readTVarIO
+
+writeTVar_ :: MonadIO m => TVar a -> a -> m ()
+writeTVar_ var val = liftIO $ atomically $ writeTVar var val
+
+swapTVar_ :: MonadIO m => TVar a -> a -> m a
+swapTVar_ var val = liftIO $ atomically $ swapTVar var val
+
+modifyTVar_ :: MonadIO m => TVar a -> (a -> a) -> m ()
+modifyTVar_ var f = liftIO $ atomically $ modifyTVar' var f
+
+use' :: (MonadReader s m, MonadIO m) => (s -> TVar a) -> m a
+use' getter = readTVar_ =<< asks getter
+
+uses' :: (MonadReader s m, MonadIO m) => (s -> TVar a) -> (a -> r) -> m r
+uses' getter f = f <$> use' getter
+
+(.==) :: (MonadReader s m, MonadIO m) => (s -> TVar a) -> a -> m ()
+getter .== x = do
+  v <- asks getter
+  writeTVar_ v x
+(%==) :: (MonadReader s m, MonadIO m) => (s -> TVar a) -> (a -> a) -> m ()
+getter %== f = do
+  v <- asks getter
+  modifyTVar_ v f
 
 -------------------------------------------------------------------------------
 -- Commands
 -------------------------------------------------------------------------------
 
-ghcidCheck :: CommandArguments -> Maybe String -> Neovim r GhcidState ()
+ghcidCheck :: CommandArguments -> Maybe String -> NeovimGhcid ()
 ghcidCheck ca mFile = do
     file <- maybe nvimCurrentFile return mFile
     mtgt <- lookupFile file >>= \case
@@ -74,47 +122,45 @@ ghcidCheck ca mFile = do
     whenJust mtgt (warnIfNotLoaded file)
   where
     default' = bang ca == Just True
-    warnIfNotLoaded file tgt = do
+    warnIfNotLoaded file tgt =
       unless (file `elem` filesInTarget tgt) $
         vim_report_error' $
           "Warning: " ++ file ++ " is not loaded in this target\n"
 
-ghcidShowStatus :: CommandArguments -> Neovim r GhcidState ()
+ghcidShowStatus :: CommandArguments -> NeovimGhcid ()
 ghcidShowStatus _ = do
-  tgts <- use targets
+  tgts <- use' targets
   if null tgts
     then vim_report_error' "no ghci process is running"
     else vim_report_error' $ init $ unlines $ concat
             [ t^.targetName : map ("  "++) (S.toList (moduleNamesInTarget t) <&> id)
             | (_,t) <- M.toList tgts ]
 
-ghcidStopAll :: CommandArguments -> Neovim r GhcidState ()
+ghcidStopAll :: CommandArguments -> NeovimGhcid ()
 ghcidStopAll _ = do
-  tgts <- use targets
-  targets .= M.empty
-  forM_ tgts $ \t -> do
-    liftIO $ stopGhci (t^.targetGhci)
+  tgts <- swapTVar_ `flip` M.empty =<< asks targets
+  liftIO $ forM_ tgts $ \t -> stopGhci (t^.targetGhci)
 
 -------------------------------------------------------------------------------
 -- Target
 -------------------------------------------------------------------------------
 
-lookupFile :: FilePath -> Neovim r GhcidState (Maybe Target)
-lookupFile f = uses targets $ find (`hasFile` f)
+lookupFile :: FilePath -> NeovimGhcid (Maybe Target)
+lookupFile f = uses' targets $ find (`hasFile` f)
 
-lookupTgtname :: String -> Neovim r GhcidState (Maybe Target)
-lookupTgtname tgtName = uses targets $ find ((tgtName==) . view targetName)
+lookupTgtname :: String -> NeovimGhcid (Maybe Target)
+lookupTgtname tgtName = uses' targets $ find ((tgtName==) . (^.targetName))
 
 hasFile :: Target -> FilePath -> Bool
 hasFile t f = f `S.member` filesInTarget t
 
-addTarget :: Target -> Neovim r GhcidState ()
-addTarget p = targets %= M.insert (p^.targetID) p
+addTarget :: Target -> NeovimGhcid ()
+addTarget p = targets %== M.insert (p^.targetID) p
 
-ghciTarget :: Ghci -> Directory -> FilePath -> String -> Neovim r GhcidState Target
+ghciTarget :: Ghci -> Directory -> FilePath -> String -> NeovimGhcid Target
 ghciTarget g (Directory rootDir) cabal name = do
     files <- liftIO $ map (second mkAbosolute) <$> showModules g
-    id'   <- unique <+= 1
+    id'   <- genUnique
     return $ Target id' name cabal g (S.fromList files)
   where
     -- When files are in rootDir, 'showModules' returns relative paths.
@@ -124,7 +170,7 @@ ghciTarget g (Directory rootDir) cabal name = do
       | isRelative f = rootDir </> f
       | otherwise    = f
 
-reloadTarget :: Target -> Neovim r GhcidState Target
+reloadTarget :: Target -> NeovimGhcid Target
 reloadTarget tgt@Target{_targetGhci=g} = do
   setLoadsQFlist =<< liftIO (reload g)
   files <- S.fromList <$> liftIO (showModules g)
@@ -136,21 +182,21 @@ reloadTarget tgt@Target{_targetGhci=g} = do
 --
 -------------------------------------------------------------------------------
 
-newGhci :: Bool -> Neovim r GhcidState (Maybe Target)
+newGhci :: Bool -> NeovimGhcid (Maybe Target)
 newGhci default' = do
   dir <- Directory <$> nvimCurrentFileDir
   guessProjectSettings (thisAndParentDirectories dir) >>= askTarget default' >>= \case
     Just (root@(Directory rootDir), cabal, tgtName, cmd) ->
       lookupTgtname tgtName >>= \case
         Nothing -> do
-          (g, loads)  <- liftIO (startGhci cmd (Just rootDir) (\_ _ -> return ()))
-                            `catch` \(e :: SomeException) -> do
-                              vim_report_error' (show e)
-                              throwM e
-          setLoadsQFlist loads
-          tgt <- ghciTarget g root cabal tgtName
-          addTarget tgt
-          return $ Just tgt
+          m <- liftIO $ (Right <$> startGhci cmd (Just rootDir) (\_ _ -> return ()))
+                    `catch` \(e :: SomeException) -> return (Left e)
+          case m of
+            Right (g, loads) -> do setLoadsQFlist loads
+                                   tgt <- ghciTarget g root cabal tgtName
+                                   addTarget tgt
+                                   return $ Just tgt
+            Left e -> vim_report_error' (show e) >> throwM e
 
         Just tgt -> Just <$> reloadTarget tgt
 
@@ -159,14 +205,14 @@ newGhci default' = do
 
 -- Returns (project root, cabal file, target name, command to be passed to ghcid)
 askTarget :: Bool -> Maybe (BuildTool, Directory)
-          -> Neovim r GhcidState (Maybe (Directory, FilePath, String, String))
+          -> NeovimGhcid (Maybe (Directory, FilePath, String, String))
 askTarget default' (Just (Stack, dir))   = askTarget' default' "stack ghci" dir
 askTarget default' (Just (Cabal{}, dir)) = askTarget' default' "cabal repl" dir
-askTarget _ _ = vim_report_error' msg >> err msg
+askTarget _ _ = vim_report_error' msg >> err (pretty msg)
   where msg = "*.cabal not found"
 
 askTarget' :: Bool -> String -> Directory
-           -> Neovim r GhcidState (Maybe (Directory, FilePath, String, String))
+           -> NeovimGhcid (Maybe (Directory, FilePath, String, String))
 askTarget' default' baseCmd dir@(Directory dirPath) = do
   cabal <- getCabalFile dirPath
   let cabalPath   = dirPath </> cabal
@@ -194,18 +240,19 @@ enumCandidates GenericPackageDescription{..} packageName = concat [libs, exes, t
     exes  = [ packageName ++ ":exe:"  ++ unUnqualComponentName exe  | (exe,_)  <- condExecutables ]
     tests = [ packageName ++ ":test:" ++ unUnqualComponentName test | (test,_) <- condTestSuites  ]
 
-getCabalFile :: FilePath -> Neovim r st FilePath
+getCabalFile :: FilePath -> Neovim st FilePath
 getCabalFile dir = do
   files <- liftIO $ getDirectoryContents dir
-  return (find (".cabal" `isSuffixOf`) files)
-            `orThrow` ("*.cabal not found" :: String)
+  case find (".cabal" `isSuffixOf`) files of
+    Just f -> return f
+    Nothing -> err "*.cabal not found"
 
 -------------------------------------------------------------------------------
 -- Quickfix
 -------------------------------------------------------------------------------
 
 -- | Set error/warnings in Quickfix list
-setLoadsQFlist :: [Load] -> Neovim r st ()
+setLoadsQFlist :: [Load] -> Neovim st ()
 setLoadsQFlist loads = do
   Q.setqflist qfs Q.Replace
   if null qfs
@@ -233,7 +280,7 @@ toQFItems (Message severity file (lnum,col) msgs) = header : map f msgs
     header = Q.QFItem {
         Q.bufOrFile     = Right file
       , Q.lnumOrPattern = Left lnum
-      , Q.col           = Just (col, True)
+      , Q.col           = Q.ByteIndexColumn col
       , Q.nr            = Nothing
       , Q.text          = ""
       , Q.errorType     = toQFSeverity severity
@@ -241,7 +288,7 @@ toQFItems (Message severity file (lnum,col) msgs) = header : map f msgs
     f msg = Q.QFItem {
         Q.bufOrFile     = Right ""
       , Q.lnumOrPattern = Right ""
-      , Q.col           = Nothing
+      , Q.col           = Q.NoColumn
       , Q.nr            = Nothing
       , Q.text          = msg
       , Q.errorType     = Q.Warning
@@ -251,33 +298,28 @@ toQFItems (Message severity file (lnum,col) msgs) = header : map f msgs
     toQFSeverity Ghcid.Warning = Q.Warning
 
 -------------------------------------------------------------------------------
--- Utility
+-- Neovim Util
 -------------------------------------------------------------------------------
 
 -- | an alternative to `vim_out_write'` which doesn't work for me :(
-nvimEcho :: String -> Neovim r st ()
+nvimEcho :: String -> Neovim st ()
 nvimEcho s = void $ vim_command_output $ "echom " ++ show s
 
 -- | return the canonical path of current working directory
 
 --   `canonicalizePath` is necessary because nvim can return
 --   a not canonical path such as "/foo//bar" ('/' duplicated)
-nvimCWD :: Neovim r st FilePath
+nvimCWD :: Neovim st FilePath
 nvimCWD = liftIO . canonicalizePath =<<
   errOnInvalidResult (vim_call_function "getcwd" [])
 
 -- | return the canonical path of the current file's directory
-nvimCurrentFileDir :: Neovim r st FilePath
+nvimCurrentFileDir :: Neovim st FilePath
 nvimCurrentFileDir = liftIO . canonicalizePath =<<
   errOnInvalidResult (vim_call_function "expand" [ObjectString "%:p:h"])
 
 -- | return the canonical path of the current file
-nvimCurrentFile :: Neovim r st FilePath
+nvimCurrentFile :: Neovim st FilePath
 nvimCurrentFile = liftIO . canonicalizePath =<<
   errOnInvalidResult (vim_call_function "expand" [ObjectString "%:p"])
-
-orThrow :: Pretty e => Neovim r st (Maybe a) -> e -> Neovim r st a
-orThrow m e = m >>= \case
-  Just x -> return x
-  Nothing -> err e
 
