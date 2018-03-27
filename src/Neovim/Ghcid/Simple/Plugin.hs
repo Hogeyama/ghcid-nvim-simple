@@ -66,6 +66,7 @@ data GhcidEnv = GhcidEnv
   }
 makeLenses ''GhcidEnv
 
+{-# NOINLINE initialEnv #-}
 initialEnv :: GhcidEnv
 initialEnv = GhcidEnv
   { targets = unsafePerformIO (newTVarIO M.empty)
@@ -76,7 +77,7 @@ genUnique :: NeovimGhcid Int
 genUnique = do
   v <- asks unique
   liftIO $ atomically $ do
-    modifyTVar' v (+1)
+    modifyTVar' v succ
     readTVar v
 
 
