@@ -19,6 +19,7 @@ library:
     - bytestring
     - containers
     - exceptions
+    - unliftio
     - extra
     - stm
     - mtl

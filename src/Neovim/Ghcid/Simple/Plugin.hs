@@ -9,14 +9,11 @@
 
 module Neovim.Ghcid.Simple.Plugin where
 
+import           UnliftIO
 import           Control.Arrow                          (second)
-import           Control.Concurrent.STM
-import           Control.Lens                           (makeLenses)
-import           Control.Lens.Operators
+import           Control.Lens                           (makeLenses, (^.), (%~), (&), (<&>))
 import           Control.Monad                          (forM_, unless)
-import           Control.Monad.IO.Class
-import           Control.Monad.Reader
-import           Control.Monad.Catch                    (SomeException, catch, throwM)
+import           Control.Monad.Reader                   (MonadReader)
 import           Control.Monad.Extra                    (whenJust)
 import qualified Data.ByteString.Char8                  as B
 import           Data.List                              (find, isSuffixOf)
@@ -30,6 +27,7 @@ import           Distribution.PackageDescription.Parse  (readGenericPackageDescr
 import           Distribution.Types.UnqualComponentName (unUnqualComponentName)
 import           Distribution.Verbosity                 (silent)
 import           Language.Haskell.Ghcid                 as Ghcid
+
 import           Neovim
 import           Neovim.BuildTool
 import qualified Neovim.Quickfix                        as Q
@@ -190,15 +188,12 @@ newGhci default' = do
     Just (root@(Directory rootDir), cabal, tgtName, cmd) ->
       lookupTgtname tgtName >>= \case
         Nothing -> do
-          m <- liftIO $ (Right <$> startGhci cmd (Just rootDir) (\_ _ -> return ()))
-                    `catch` \(e :: SomeException) -> return (Left e)
-          case m of
-            Right (g, loads) -> do setLoadsQFlist loads
-                                   tgt <- ghciTarget g root cabal tgtName
-                                   addTarget tgt
-                                   return $ Just tgt
-            Left e -> vim_report_error' (show e) >> throwM e
-
+          (g, loads) <- liftIO (startGhci cmd (Just rootDir) (\_ _ -> return ()))
+                          `withSomeExcecption` (vim_report_error' . show)
+          setLoadsQFlist loads
+          tgt <- ghciTarget g root cabal tgtName
+          addTarget tgt
+          return $ Just tgt
         Just tgt -> Just <$> reloadTarget tgt
 
     _ -> vim_report_error' "canceled" >> return Nothing
@@ -323,4 +318,7 @@ nvimCurrentFileDir = liftIO . canonicalizePath =<<
 nvimCurrentFile :: Neovim st FilePath
 nvimCurrentFile = liftIO . canonicalizePath =<<
   errOnInvalidResult (vim_call_function "expand" [ObjectString "%:p"])
+
+withSomeExcecption :: MonadUnliftIO m => m a -> (SomeException -> m b) -> m a
+withSomeExcecption = withException
 
