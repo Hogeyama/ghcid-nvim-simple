@@ -10,9 +10,13 @@ import           Neovim.Ghcid.Simple.Plugin
 plugin :: Neovim (StartupConfig NeovimConfig) NeovimPlugin
 plugin = wrapPlugin Plugin
   { environment = initialEnv
-  , exports = [ $(command' 'ghcidCheck)      ["async", "!"]
-              , $(command' 'ghcidShowStatus) ["async"]
-              , $(command' 'ghcidStopAll)    ["async"]
+  , exports = [ $(command'  'ghcidCheck)           ["async", "!"]
+              , $(command'  'ghcidShowStatus)      ["async"]
+              , $(command'  'ghcidStopAll)         ["async"]
+              , $(command'  'ghcidExec)            ["async"]
+              , $(command'  'ghcidType)            ["async"]
+              , $(command'  'ghcidTypeCurrentWord) ["async"]
+              -- , $(function' 'ghcidExecute)         Async
               ]
   }
 

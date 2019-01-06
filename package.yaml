@@ -11,6 +11,7 @@ library:
   dependencies:
     - nvim-hs >= 1.0.0.0
     - nvim-hs-contrib >= 1.0.0.0
+    - rio
     - ghcid
     - lens
     - Cabal >= 2.0.0.0
