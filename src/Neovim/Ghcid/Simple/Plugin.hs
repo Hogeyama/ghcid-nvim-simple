@@ -18,9 +18,7 @@ import           Control.Lens                           (makeLenses, (%~), (<&>)
 import           Control.Monad.Extra                    (whenJust)
 import           Distribution.PackageDescription        (GenericPackageDescription (..))
 import           Distribution.PackageDescription.Parsec (readGenericPackageDescription)
-import qualified Distribution.Pretty                    as D
-import           Distribution.Types.Component           (componentName)
-import           Distribution.Types.PackageDescription  (pkgBuildableComponents)
+import           Distribution.Types.UnqualComponentName (unUnqualComponentName)
 import           Distribution.Verbosity                 (silent)
 import qualified Language.Haskell.Ghcid                 as Ghcid
 
@@ -125,7 +123,6 @@ ghcidExecute mbuffer cmd = do
       Nothing -> vim_report_error' "current file is not loaded"
       Just tgt -> do
         result <- execCmdTarget tgt cmd
-        liftIO $ writeFile "/tmp/ghcid-nvim-simple.log" $ init (unlines result)
         let content = init $ unlines result
         case mbuffer of
           Nothing -> nvimEchoe content
@@ -152,10 +149,11 @@ data TargetConfig = TargetConfig
 newTarget :: TargetConfig -> NeovimGhcid (Target, [QfItem])
 newTarget TargetConfig{..} = do
     (ghci, loads) <-
-        liftIO (Ghcid.startGhci
-          cCommandStr
-          (Just projectRootDir)
-          (\_ _ -> return ()))
+        liftIO
+          (Ghcid.startGhci
+            cCommandStr
+            (Just projectRootDir)
+            (\_ _ -> return ()))
       `withException`
         (vim_report_error' . show @SomeException)
     tgt <- do
@@ -261,12 +259,12 @@ newGhci default' = do
     Nothing -> vim_report_error' "canceled" >> return Nothing
 
 askTarget
-  :: Bool -> Maybe (BuildTool, Directory)
-  -- | Project root, Cabal file, Target name, Commands)
+  :: Bool
+  -> Maybe (BuildTool, Directory)
   -> NeovimGhcid (Maybe TargetConfig)
 askTarget default' setting = do
     (baseCmd, dir@(Directory dirPath)) <- case setting of
-        (Just (Stack, dir))   -> return ("stack ghci", dir)
+        (Just (Stack, dir))   -> return ("stack repl", dir)
         (Just (Cabal{}, dir)) -> return ("cabal repl", dir)
         _ -> let msg = "*.cabal not found"
               in vim_report_error' msg >> err (pretty msg)
@@ -299,9 +297,11 @@ askTarget default' setting = do
           Nothing -> return Nothing
 
 enumCandidates :: GenericPackageDescription -> String -> [String]
-enumCandidates GenericPackageDescription{..} packageName =
-    [ packageName ++ ":" ++ show (D.pretty (componentName comp))
-    | comp <- pkgBuildableComponents packageDescription ]
+enumCandidates GenericPackageDescription{..} packageName = concat [libs, exes, tests]
+  where
+    libs  = [ packageName ++ ":lib"                                 | isJust condLibrary          ]
+    exes  = [ packageName ++ ":exe:"  ++ unUnqualComponentName exe  | (exe,_)  <- condExecutables ]
+    tests = [ packageName ++ ":test:" ++ unUnqualComponentName test | (test,_) <- condTestSuites  ]
 
 getCabalFile :: FilePath -> Neovim st FilePath
 getCabalFile dir = do
