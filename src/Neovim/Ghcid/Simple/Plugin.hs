@@ -28,8 +28,8 @@ import qualified Neovim.Quickfix                        as Q
 import           Neovim.User.Choice                     (askForIndex)
 import           System.Directory                       (canonicalizePath,
                                                          getDirectoryContents)
-import           System.FilePath                        (dropExtension,
-                                                         isRelative, (</>))
+import           System.FilePath                        (dropExtension, isRelative,
+                                                         makeRelative, (</>))
 import           System.IO.Unsafe                       (unsafePerformIO)
 
 -------------------------------------------------------------------------------
@@ -208,16 +208,16 @@ loadsToQFItems = concatMap loadToQFItems . filterLoads
     loadToQFItems (Ghcid.Message severity file (lnum,col) _posEnd msgs) =
         header : map f msgs
       where
-        header = Q.QFItem {
-            Q.bufOrFile     = Right file
+        header = Q.QFItem
+          { Q.bufOrFile     = Right file
           , Q.lnumOrPattern = Left lnum
           , Q.col           = Q.ByteIndexColumn col
           , Q.nr            = Nothing
           , Q.text          = ""
           , Q.errorType     = toQFSeverity severity
           }
-        f msg = Q.QFItem {
-            Q.bufOrFile     = Right ""
+        f msg = Q.QFItem
+          { Q.bufOrFile     = Right ""
           , Q.lnumOrPattern = Right ""
           , Q.col           = Q.NoColumn
           , Q.nr            = Nothing
@@ -280,9 +280,11 @@ askTarget default' setting = do
     if default'
       then return (Just defaultCfg)
       else do
-        candidates <- liftIO $ do
+        candidatesFromPackage <- liftIO $ do
           description <- readGenericPackageDescription silent cabalFile
           return $ enumCandidates description packageName
+        currentFile <- makeRelative dirPath <$> nvimCurrentFile
+        let candidates = currentFile : candidatesFromPackage
         answer <- askForIndex $
           map (ObjectString . fromString @ByteString)
             [ "("++show n++") " ++ baseCmd ++ " " ++ c
